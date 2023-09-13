@@ -12,6 +12,7 @@
 import os
 import math
 import torch
+import matplotlib
 import numpy as np
 from argparse import ArgumentParser
 from kaolin.render.camera import Camera
@@ -96,15 +97,72 @@ def get_rotating_angles(
     return azims, elevs
 
 
+POSITIVE_COLOR = matplotlib.colormaps["Reds"]
+NEGATIVE_COLOR = matplotlib.colormaps["Blues"]
+def heatmap_numpy(image):
+    """Get the heatmap of the image
+
+    Args:
+        image : A numpy array of shape (N, H, W) and scale in [-1, 1]
+
+    Returns:
+        A image of shape (N, H, W, 3) in [0, 1] scale
+    """
+    image1 = image.copy()
+    mask1 = image1 > 0
+    image1[~mask1] = 0
+
+    image2 = -image.copy()
+    mask2 = image2 > 0
+    image2[~mask2] = 0
+
+    pos_img = POSITIVE_COLOR(image1)[:, :, :, :3]
+    neg_img = NEGATIVE_COLOR(image2)[:, :, :, :3]
+
+    x = np.ones_like(pos_img)
+    x[mask1] = pos_img[mask1]
+    x[mask2] = neg_img[mask2]
+
+    return x
+
+
+def heatmap_torch(image):
+    """Torch tensor version of heatmap_numpy.
+
+    Args:
+        image : torch.Tensor in [N, H, W] in [-1, 1] scale
+    Returns:
+        heatmap : torch.Tensor in [N, 3, H, W] in [0, 1]
+    """
+    x = heatmap_numpy(image.detach().cpu().numpy())
+    return torch.from_numpy(x).type_as(image).permute(0, 3, 1, 2)
+
+
+def visualize_depth(depths, min_depth=2, max_depth=2.7):
+    """Visualize by normalizing depth in the foreground area."""
+    fg_mask = depths > min_depth
+    #fg_depth = depths[fg_mask]
+    #zmin, zmax = fg_depth.min(), fg_depth.max()
+    zmin, zmax = depths.min(), depths.max()
+    depths = (depths - min_depth) / (zmax - min_depth)
+    #depths = depths.clamp(0, 1) - 1 + fg_mask.float()
+    #return heatmap_torch(depths.squeeze(1)) * 255
+    return (depths * fg_mask.float() * 255).repeat(1, 3, 1, 1)
+
+
 def render_rotate(gaussians, pipeline, background):
-    frames = []
+    """"""
+    images, depths = [], []
     azims, elevs = get_rotating_angles()
     for azim, elev in tqdm(zip(azims, elevs), total=azims.shape[0]):
         cam = get_ffhq_camera(azim, elev)
-        rendering = render(cam, gaussians, pipeline, background)["render"]
-        image = rendering.clamp(0, 1).permute(1, 2, 0) * 255
-        frames.append(image.cpu().numpy().astype("uint8"))
-    return frames
+        res = render(cam, gaussians, pipeline, background)
+        images.append(res["render"])
+        depths.append(res["depth"])
+    images = torch.stack(images).clamp(0, 1) * 255
+    depths = visualize_depth(torch.stack(depths))
+    frames = torch.cat([images, depths], 3).permute(0, 2, 3, 1)
+    return frames.cpu().numpy().astype("uint8")
 
 
 if __name__ == "__main__":
