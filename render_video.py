@@ -12,29 +12,17 @@
 import os
 import math
 import torch
-import imageio
-import torchvision
 import numpy as np
-from os import makedirs
 from argparse import ArgumentParser
 from kaolin.render.camera import Camera
 from tqdm import tqdm
 import imageio.v2 as iio
 
-from scene import Scene
 from gaussian_renderer import render
 from utils.general_utils import safe_state
 from scene.cameras import MiniCam, getProjectionMatrix
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
-from scene.colmap_loader import qvec2rotmat, rotmat2qvec
-
-
-def normalize_vecs(vectors: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize vector lengths.
-    """
-    return vectors / (torch.norm(vectors, dim=-1, keepdim=True))
 
 
 def kaolin_cam_to_colmap(kaolin_cam2world: torch.Tensor, inplace: bool=True):
@@ -57,60 +45,66 @@ def FOV_to_intrinsics(fov_degrees, device='cpu'):
     return intrinsics
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-
-    makedirs(render_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-
+def get_ffhq_camera(azim, elev):
+    """Return a camera with FFHQ intrinsics.
+    """
     fov_deg = 14
     FOVx = FOVy = math.pi * fov_deg / 180
     radius = 2.7
-    
     look_at = torch.Tensor([0., 0., 0.]).float()
     up_vec = torch.Tensor([0., 1., 0.]).float()
     proj_matrix = getProjectionMatrix(znear=1e-2, zfar=1e2, fovX=FOVx, fovY=FOVy).transpose(0,1)
-    
-    writer = iio.get_writer(f"{render_path}/my_video.mp4", 
-        format='FFMPEG', mode='I', fps=30,
+
+    x = radius * math.cos(azim)
+    y = radius * math.sin(elev)
+    z = radius * math.sin(azim)
+    cam_center = torch.Tensor([x, y, z])
+    kaolin_camera = Camera.from_args(
+        eye=cam_center, at=look_at, up=up_vec,
+        width=512, height=512, fov=14 * math.pi / 180)
+    kaolin_cam2world = kaolin_camera.extrinsics.inv_view_matrix()[0]
+    colmap_cam2world = kaolin_cam_to_colmap(kaolin_cam2world)
+    colmap_world2cam = colmap_cam2world.inverse().transpose(0, 1)
+    colmap_fullproj = colmap_world2cam @ proj_matrix
+    return MiniCam(512, 512, FOVx, FOVy, 1e-2, 1e2, colmap_world2cam.cuda(), colmap_fullproj.cuda())
+
+
+def write_video(output_path, frames, fps=30):
+    """Write a video to output path from the frames.
+    """
+    writer = iio.get_writer(output_path, 
+        format='FFMPEG', mode='I', fps=fps,
         codec='h264',
         pixelformat='yuv420p')
+    for f in frames:
+        writer.append_data(f)
+    writer.close()
 
-    frames = []
-    elevs = np.linspace(-np.pi / 4, np.pi / 4, 180)
+
+def get_rotating_angles(
+        n_steps=360,
+        n_rot=3,
+        elev_low=-math.pi/4,
+        elev_high=math.pi/4):
+    """Return the elevation and azimus angle of 360 rotation.
+    """
+    half_steps = n_steps // 2
+    rot_steps = n_steps // n_rot
+    elevs = np.linspace(elev_low, elev_high, half_steps)
     elevs = np.concatenate([elevs, elevs[::-1]])
-    azims = np.concatenate([np.linspace(-np.pi, np.pi, 120)] * 3)
-    for idx, (azim, elev) in enumerate(tqdm(zip(azims, elevs))):
-        x = radius * math.cos(azim)
-        y = radius * math.sin(elev)
-        z = radius * math.sin(azim)
-        cam_center = torch.Tensor([x, y, z])
-        kaolin_camera = Camera.from_args(eye=cam_center, at=look_at, up=up_vec, width=512, height=512, fov=14 * math.pi / 180)
-        kaolin_cam2world = kaolin_camera.extrinsics.inv_view_matrix()[0]
-        colmap_cam2world = kaolin_cam_to_colmap(kaolin_cam2world)
-        colmap_world2cam = colmap_cam2world.inverse().transpose(0, 1)
-        colmap_fullproj = colmap_world2cam @ proj_matrix
-        cam = MiniCam(512, 512, FOVx, FOVy, 1e-2, 1e2, colmap_world2cam.cuda(), colmap_fullproj.cuda())
-        rendering = render(cam, gaussians, pipeline, background)["render"]
+    azims = np.concatenate([np.linspace(-np.pi, np.pi, rot_steps)] * n_rot)
+    return azims, elevs
 
+
+def render_rotate(gaussians, pipeline, background):
+    frames = []
+    azims, elevs = get_rotating_angles()
+    for azim, elev in tqdm(zip(azims, elevs), total=azims.shape[0]):
+        cam = get_ffhq_camera(azim, elev)
+        rendering = render(cam, gaussians, pipeline, background)["render"]
         image = rendering.clamp(0, 1).permute(1, 2, 0) * 255
         frames.append(image.cpu().numpy().astype("uint8"))
-        writer.append_data(frames[-1])
-    writer.close()
-    #imageio.mimsave(f"{render_path}/rotate.mp4", frames)
-
-
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
-
-    with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree)
-        scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-        render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+    return frames
 
 
 if __name__ == "__main__":
@@ -118,14 +112,26 @@ if __name__ == "__main__":
     parser = ArgumentParser(description="Testing script parameters")
     model = ModelParams(parser, sentinel=True)
     pipeline = PipelineParams(parser)
-    parser.add_argument("--iteration", default=-1, type=int)
+    parser.add_argument("--output_path", default="../../expr/gaussian_splatting/rendering", type=str)
+    parser.add_argument("--iteration", default=30000, type=int)
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
     args = get_combined_args(parser)
-    print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    dataset = model.extract(args)
+    pipeline = pipeline.extract(args)
+    ply_path = os.path.join(dataset.model_path, "point_cloud", f"iteration_{args.iteration}", "point_cloud.ply")
+    gaussians = GaussianModel(dataset.sh_degree)
+    gaussians.load_ply(ply_path)
+    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    with torch.no_grad():
+        frames = render_rotate(gaussians, pipeline, background)
+    os.makedirs(args.output_path, exist_ok=True)
+    model_name = dataset.model_path.split("/")[-1]
+    output_path = f"{args.output_path}/{model_name}_rotate.mp4"
+    write_video(output_path, frames)
