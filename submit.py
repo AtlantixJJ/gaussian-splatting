@@ -22,14 +22,14 @@ def register(func):
 
 @register
 def recon():
-    cmd = "python train.py -s ../cdmPanoHead/colmap_data/seed{idx} --model_path output/seed{idx} --white_background"
-    for idx in range(5, 100):
+    cmd = "python train_simple.py -s ../cdmPanoHead/colmap_data/seed{idx} --model_path PanoHead_185_random/seed{idx} --white_background"
+    for idx in range(1, 100):
         yield cmd.format(idx=idx)
 
 
 @register
 def render():
-    cmd = "python render_video.py -m ../cdmPanoHead/colmap_data/seed{idx} --model_path output/seed{idx} --white_background"
+    cmd = "python render_video.py -m ../cdmPanoHead/colmap_data/seed{idx} --model_path PanoHead_185_random/seed{idx} --white_background"
     for idx in range(1, 100):
         yield cmd.format(idx=idx)
 

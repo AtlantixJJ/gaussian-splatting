@@ -9,17 +9,19 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import os
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from torch import nn
-import os
+from collections import OrderedDict
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+
 
 class GaussianModel:
 
@@ -39,7 +41,6 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
-
 
     def __init__(self, sh_degree : int):
         self.active_sh_degree = 0
@@ -121,22 +122,47 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
+    def random_init(self, N, spatial_lr_scale):
+        self.spatial_lr_scale = spatial_lr_scale
+        fused_point_cloud = torch.randn(N, 3).cuda()
+        fused_color = RGB2SH(torch.rand(N, 3).cuda())
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features[:, :3, 0 ] = fused_color
+        features[:, 3:, 1:] = 0.0 # [Question] (N, 3, 16) shape, why 3:?
+
+        scales = torch.zeros_like(fused_point_cloud) - 5
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots[:, 0] = 1
+
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
+        self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
+        self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
-        features[:, 3:, 1:] = 0.0
+        features[:, 3:, 1:] = 0.0 # [Question] (N, 3, 16) shape, why 3:?
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)
+        #print(scales.shape, scales.min(), scales.max())
+        #scales = torch.ones(pcd.points.shape, device="cuda") * 1e-7
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        #opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(0.5 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -405,3 +431,184 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+
+class SineLayer(nn.Module):
+    # source: https://colab.research.google.com/github/vsitzmann/siren/blob/master/explore_siren.ipynb#scrollTo=rNu4H12MYXMS
+    # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
+    
+    # If is_first=True, omega_0 is a frequency factor which simply multiplies the activations before the 
+    # nonlinearity. Different signals may require different omega_0 in the first layer - this is a 
+    # hyperparameter.
+    
+    # If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of 
+    # activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
+    
+    def __init__(self, in_features, out_features, bias=True,
+                 is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        
+        self.in_features = in_features
+        self.linear = nn.Linear(in_features, out_features, bias=bias)
+        
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.linear.weight.uniform_(-1 / self.in_features, 
+                                             1 / self.in_features)      
+            else:
+                self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
+                                             np.sqrt(6 / self.in_features) / self.omega_0)
+        
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.linear(input))
+    
+    def forward_with_intermediate(self, input): 
+        # For visualization of activation distributions
+        intermediate = self.omega_0 * self.linear(input)
+        return torch.sin(intermediate), intermediate
+    
+    
+class Siren(nn.Module):
+    def __init__(self, in_features, hidden_features, hidden_layers, out_features, outermost_linear=False, 
+                 first_omega_0=30, hidden_omega_0=30.):
+        super().__init__()
+        
+        self.net = []
+        self.net.append(SineLayer(in_features, hidden_features, 
+                                  is_first=True, omega_0=first_omega_0))
+
+        for i in range(hidden_layers):
+            self.net.append(SineLayer(hidden_features, hidden_features, 
+                                      is_first=False, omega_0=hidden_omega_0))
+
+        if outermost_linear:
+            final_linear = nn.Linear(hidden_features, out_features)
+            
+            with torch.no_grad():
+                final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0, 
+                                              np.sqrt(6 / hidden_features) / hidden_omega_0)
+                
+            self.net.append(final_linear)
+        else:
+            self.net.append(SineLayer(hidden_features, out_features, 
+                                      is_first=False, omega_0=hidden_omega_0))
+        
+        self.net = nn.Sequential(*self.net)
+    
+    def forward(self, coords):
+        coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
+        self.output = self.net(coords)
+        return self.output, coords        
+
+
+def laplace(y, x):
+    grad = gradient(y, x)
+    return divergence(grad, x)
+
+
+def divergence(y, x):
+    div = 0.
+    for i in range(y.shape[-1]):
+        div += torch.autograd.grad(y[..., i], x, torch.ones_like(y[..., i]), create_graph=True)[0][..., i:i+1]
+    return div
+
+
+def gradient(y, x, grad_outputs=None):
+    if grad_outputs is None:
+        grad_outputs = torch.ones_like(y)
+    grad = torch.autograd.grad(y, [x], grad_outputs=grad_outputs, create_graph=True)[0]
+    return grad
+
+
+def get_mgrid(sidelen, dim=2):
+    '''Generates a flattened grid of (x,y,...) coordinates in a range of -1 to 1.
+    sidelen: int
+    dim: int'''
+    tensors = tuple(dim * [torch.linspace(-1, 1, steps=sidelen)])
+    mgrid = torch.stack(torch.meshgrid(*tensors), dim=-1)
+    mgrid = mgrid.reshape(-1, dim)
+    return mgrid
+
+
+class ParametrizedGaussianModel(GaussianModel):
+    """
+    Args:
+        n_init: The number of initialized points.
+    """
+
+    def __init__(self, n_init, in_dim, h_dim, n_layer, sh_degree):
+        super(ParametrizedGaussianModel, self).__init__(sh_degree)
+        self.random_init(n_init, 0.1)
+
+        self.param_names = ["_xyz", "_scaling", "_rotation", "_opacity", "_features_dc", "_features_rest"]
+
+        self.out_dim = sum([getattr(self, pname).view(n_init, -1).shape[1]
+                        for pname in self.param_names])
+        self.in_dim, self.h_dim = in_dim, h_dim
+        self.backbone = Siren(in_dim, h_dim, n_layer, self.out_dim, True)
+        self.in_coords = get_mgrid(50, 3)
+
+    def update_learning_rate(self, iteration):
+        ''' Learning rate scheduling per step '''
+        self.grad_multiplier[0] = self.xyz_scheduler_args(iteration)
+
+    def apply_grad_multiplier(self, gradOutput):
+        count = 0
+        for pname, mult in zip(self.param_names, self.grad_multiplier):
+            param = getattr(self, pname)
+            l = param.view(param.shape[0], -1).shape[1]
+            gradOutput[:, count : count + l] *= mult
+        return gradOutput
+
+    def apply_output(self, y):
+        """Update the parameters from the output.
+        """
+        count = 0
+        for pname in self.param_names:
+            param = getattr(self, pname)
+            l = param.view(param.shape[0], -1).shape[1]
+            v = y[:, count : count + l].view(-1, *param.shape[1:])
+            if pname == "_scaling": # need to have proper scale
+                v = v - 4
+            setattr(self, pname, v)
+            count += l
+
+    def training_setup(self, training_args):
+        self.percent_dense = training_args.percent_dense
+        self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        self.grad_multiplier = [
+            1e-2 * training_args.position_lr_init * self.spatial_lr_scale,
+            1e-2 * training_args.scaling_lr,
+            1e-2 * training_args.rotation_lr,
+            1e-2 * training_args.opacity_lr,
+            1e-2 * training_args.feature_lr,
+            1e-2 * training_args.feature_lr / 20.0]
+        self.optimizer = torch.optim.Adam(self.backbone.parameters(), lr=1e-3, eps=1e-15)
+        self.xyz_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
+            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
+            lr_delay_mult=training_args.position_lr_delay_mult,
+            max_steps=training_args.position_lr_max_steps)
+        self.decode()
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        
+    def to(self, device):
+        self.backbone.to(device)
+        self.in_coords = self.in_coords.to(device)
+        return self
+
+    def decode(self):
+        """Decode to explicit parameters"""
+        self.apply_output(self.backbone(self.in_coords)[0])
+
+    def backward(self, gradOutput):
+        self.backbone.output.backward(
+            gradient=self.apply_grad_multiplier(gradOutput))
+        #self.backbone.backward(self.apply_grad_multiplier(gradOutput))

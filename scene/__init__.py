@@ -12,9 +12,10 @@
 import os
 import random
 import json
+import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
-from scene.gaussian_model import GaussianModel
+from scene.gaussian_model import GaussianModel, ParametrizedGaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 
@@ -63,8 +64,8 @@ class Scene:
                 json.dump(json_cams, file)
 
         if shuffle:
-            random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
-            random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
+            np.random.RandomState(1).shuffle(scene_info.train_cameras)
+            np.random.RandomState(1).shuffle(scene_info.test_cameras)
 
         self.cameras_extent = scene_info.nerf_normalization["radius"]
 
