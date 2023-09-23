@@ -12,6 +12,7 @@
 import os
 import torch
 import numpy as np
+import torch.nn.functional as F
 from torch import nn
 from collections import OrderedDict
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -501,9 +502,8 @@ class Siren(nn.Module):
         self.net = nn.Sequential(*self.net)
     
     def forward(self, coords):
-        coords = coords.clone().detach().requires_grad_(True) # allows to take derivative w.r.t. input
         self.output = self.net(coords)
-        return self.output, coords        
+        return self.output        
 
 
 def laplace(y, x):
@@ -535,80 +535,229 @@ def get_mgrid(sidelen, dim=2):
     return mgrid
 
 
+def expected_sin(x_means: torch.Tensor, x_vars: torch.Tensor) -> torch.Tensor:
+    """Computes the expected value of sin(y) where y ~ N(x_means, x_vars)
+
+    Args:
+        x_means: Mean values.
+        x_vars: Variance of values.
+
+    Returns:
+        torch.Tensor: The expected value of sin.
+    """
+
+    return torch.exp(-0.5 * x_vars) * torch.sin(x_means)
+
+
+class NeRFEncoding(nn.Module):
+    """Multi-scale sinusoidal encodings. Support ``integrated positional encodings`` if covariances are provided.
+    Each axis is encoded with frequencies ranging from 2^min_freq_exp to 2^max_freq_exp.
+
+    Args:
+        in_dim: Input dimension of tensor
+        num_frequencies: Number of encoded frequencies per axis
+        min_freq_exp: Minimum frequency exponent
+        max_freq_exp: Maximum frequency exponent
+        include_input: Append the input coordinate to the encoding
+    """
+
+    def __init__(
+        self, in_dim: int, num_frequencies: int, min_freq_exp: float, max_freq_exp: float, include_input: bool = False
+    ) -> None:
+        super().__init__()
+        self.in_dim = in_dim
+        self.out_dim = None
+
+        self.num_frequencies = num_frequencies
+        self.min_freq = min_freq_exp
+        self.max_freq = max_freq_exp
+        self.include_input = include_input
+
+    def get_out_dim(self) -> int:
+        if self.in_dim is None:
+            raise ValueError("Input dimension has not been set")
+        out_dim = self.in_dim * self.num_frequencies * 2
+        if self.include_input:
+            out_dim += self.in_dim
+        return out_dim
+
+    def forward(self, in_tensor, covs=None):
+        """Calculates NeRF encoding. If covariances are provided the encodings will be integrated as proposed
+            in mip-NeRF.
+
+        Args:
+            in_tensor: For best performance, the input tensor should be between 0 and 1.
+            covs: Covariances of input points.
+        Returns:
+            Output values will be between -1 and 1
+        """
+        scaled_in_tensor = 2 * torch.pi * in_tensor  # scale to [0, 2pi]
+        freqs = 2 ** torch.linspace(self.min_freq, self.max_freq, self.num_frequencies).to(in_tensor.device)
+        scaled_inputs = scaled_in_tensor[..., None] * freqs  # [..., "input_dim", "num_scales"]
+        scaled_inputs = scaled_inputs.view(*scaled_inputs.shape[:-2], -1)  # [..., "input_dim" * "num_scales"]
+
+        if covs is None:
+            encoded_inputs = torch.sin(torch.cat([scaled_inputs, scaled_inputs + torch.pi / 2.0], dim=-1))
+        else:
+            input_var = torch.diagonal(covs, dim1=-2, dim2=-1)[..., :, None] * freqs[None, :] ** 2
+            input_var = input_var.reshape((*input_var.shape[:-2], -1))
+            encoded_inputs = expected_sin(
+                torch.cat([scaled_inputs, scaled_inputs + torch.pi / 2.0], dim=-1), torch.cat(2 * [input_var], dim=-1)
+            )
+
+        if self.include_input:
+            encoded_inputs = torch.cat([encoded_inputs, in_tensor], dim=-1)
+        return encoded_inputs
+    
+
+class MLP(nn.Module):
+    def __init__(self, in_dim, h_dim, n_layer, out_dim, num_freq=10):
+        super().__init__()
+        self.in_dim = in_dim
+        self.h_dim = h_dim
+        self.out_dim = out_dim
+        self.n_layer = n_layer
+        self.pos_enc = NeRFEncoding(
+            in_dim=in_dim, num_frequencies=num_freq, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
+        layers = [self.in_dim] + [self.h_dim] * n_layer + [self.out_dim]
+        self.layers = nn.ModuleList([nn.Linear(in_dim, out_dim)
+                for in_dim, out_dim in zip(layers[:-1], layers[1:])])
+
+    def forward(self, x):
+        for idx, layer in enumerate(self.layers):
+            x = layer(x)
+            if idx < len(self.layers) - 1:
+                x = F.gelu(x)
+        return x
+
+
+class ScaleLayer(nn.BatchNorm1d):
+    def __init__(self, shape, init_bias=None, init_scale=None):
+        super().__init__(shape)
+        if init_bias is not None:
+            self.load_state_dict({
+                "weight": init_scale,
+                "bias": init_bias
+            }, strict=False)
+
+
 class ParametrizedGaussianModel(GaussianModel):
     """
     Args:
         n_init: The number of initialized points.
     """
 
-    def __init__(self, n_init, in_dim, h_dim, n_layer, sh_degree):
+    def __init__(self, in_dim, h_dim, n_layer, sh_degree):
         super(ParametrizedGaussianModel, self).__init__(sh_degree)
-        self.random_init(n_init, 0.1)
-
+        self.random_init(10, self.spatial_lr_scale)
         self.param_names = ["_xyz", "_scaling", "_rotation", "_opacity", "_features_dc", "_features_rest"]
+        self.param_dim = {
+            pname: getattr(self, pname).view(10, -1).shape[1]
+            for pname in self.param_names}
+        self._affine_init()
 
-        self.out_dim = sum([getattr(self, pname).view(n_init, -1).shape[1]
-                        for pname in self.param_names])
         self.in_dim, self.h_dim = in_dim, h_dim
-        self.backbone = Siren(in_dim, h_dim, n_layer, self.out_dim, True)
-        self.in_coords = get_mgrid(50, 3)
+        self.component_backbone = torch.nn.ModuleDict({
+            #pname: Siren(in_dim, h_dim, n_layer, self.param_dim[pname])
+            pname: MLP(in_dim, h_dim, n_layer, self.param_dim[pname])
+            for pname in self.param_names})
+        self.component_scale = torch.nn.ModuleDict({
+            pname: ScaleLayer(
+                shape=(self.param_dim[pname],),
+                **self.param_affine_init[pname])
+            for pname in self.param_names})
+        #self.in_coords = get_mgrid(30, 3)
+        n_init = 20000
+        self.latent = torch.randn(n_init, in_dim, device="cuda").requires_grad_(True)
+        self.max_radii2D = torch.zeros((n_init,), device="cuda")
 
-    def update_learning_rate(self, iteration):
-        ''' Learning rate scheduling per step '''
-        self.grad_multiplier[0] = self.xyz_scheduler_args(iteration)
-
-    def apply_grad_multiplier(self, gradOutput):
-        count = 0
-        for pname, mult in zip(self.param_names, self.grad_multiplier):
-            param = getattr(self, pname)
-            l = param.view(param.shape[0], -1).shape[1]
-            gradOutput[:, count : count + l] *= mult
-        return gradOutput
-
-    def apply_output(self, y):
-        """Update the parameters from the output.
-        """
-        count = 0
+    def _affine_init(self):
+        """Create the affine initialization to get the initialization of points right."""
+        self.affine_init = {
+            "_xyz": {"init_scale": 1, "init_bias": 0},
+            "_scaling": {"init_scale": 1, "init_bias": -4},
+            "_rotation": {"init_scale": 1, "init_bias": 0},
+            "_opacity": {"init_scale": 1, "init_bias": -2},
+            "_features_dc": {"init_scale": 1, "init_bias": 0},
+            "_features_rest": {"init_scale": 0.01, "init_bias": 0}
+        }
+        self.param_affine_init = {}
         for pname in self.param_names:
-            param = getattr(self, pname)
-            l = param.view(param.shape[0], -1).shape[1]
-            v = y[:, count : count + l].view(-1, *param.shape[1:])
-            if pname == "_scaling": # need to have proper scale
-                v = v - 4
-            setattr(self, pname, v)
-            count += l
+            dic = {}
+            dim = self.param_dim[pname]
+            for key in ["init_scale", "init_bias"]:
+                dic[key] = torch.ones((dim,)) * self.affine_init[pname][key]
+            self.param_affine_init[pname] = dic
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
-        self.grad_multiplier = [
-            1e-2 * training_args.position_lr_init * self.spatial_lr_scale,
-            1e-2 * training_args.scaling_lr,
-            1e-2 * training_args.rotation_lr,
-            1e-2 * training_args.opacity_lr,
-            1e-2 * training_args.feature_lr,
-            1e-2 * training_args.feature_lr / 20.0]
-        self.optimizer = torch.optim.Adam(self.backbone.parameters(), lr=1e-3, eps=1e-15)
+        l = [{
+                'params': self.component_backbone["_xyz"].parameters(),
+                'lr': training_args.position_lr_init * self.spatial_lr_scale,
+                "name": "xyz"
+            }, {
+                'params': self.component_backbone["_features_dc"].parameters(),
+                'lr': training_args.feature_lr,
+                "name": "f_dc"
+            }, {
+                'params': self.component_backbone["_features_rest"].parameters(),
+                'lr': training_args.feature_lr / 20.0,
+                "name": "f_rest"
+            }, {
+                'params': self.component_backbone["_opacity"].parameters(),
+                'lr': training_args.opacity_lr,
+                "name": "opacity"
+            }, {
+                'params': self.component_backbone["_scaling"].parameters(),
+                'lr': training_args.scaling_lr,
+                "name": "scaling"
+            }, {
+                'params': self.component_backbone["_rotation"].parameters(),
+                'lr': training_args.rotation_lr,
+                "name": "rotation"
+            }, {
+                'params': [self.latent],
+                'lr': training_args.position_lr_init,
+                "name": "latent"
+            }, {
+                'params': self.component_scale.parameters(),
+                'lr': 1e-3,
+                "name": "scaling"
+            }]
+
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
-            lr_init=training_args.position_lr_init * self.spatial_lr_scale,
-            lr_final=training_args.position_lr_final * self.spatial_lr_scale,
+            lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+            lr_final=training_args.position_lr_final*self.spatial_lr_scale,
             lr_delay_mult=training_args.position_lr_delay_mult,
             max_steps=training_args.position_lr_max_steps)
-        self.decode()
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        
+
+    def train(self):
+        self.component_backbone.train()
+        self.component_scale.train()
+        return self
+    
+    def eval(self):
+        self.component_backbone.eval()
+        self.component_scale.eval()
+        return self
+
     def to(self, device):
-        self.backbone.to(device)
-        self.in_coords = self.in_coords.to(device)
+        self.component_backbone.to(device)
+        self.component_scale.to(device)
+        self.latent = self.latent.to(device)
         return self
 
     def decode(self):
-        """Decode to explicit parameters"""
-        self.apply_output(self.backbone(self.in_coords)[0])
-
-    def backward(self, gradOutput):
-        self.backbone.output.backward(
-            gradient=self.apply_grad_multiplier(gradOutput))
-        #self.backbone.backward(self.apply_grad_multiplier(gradOutput))
+        """Decode to explicit p arameters"""
+        for key, func in self.component_backbone.items():
+            scaler = self.component_scale[key]
+            setattr(self, key, scaler(func(self.latent)))
+        N = self._features_dc.shape[0]
+        self._features_dc = self._features_dc.view(N, 1, 3)
+        self._features_rest = self._features_rest.view(N, -1, 3)
+        for key in self.param_names:
+            v = getattr(self, key)

@@ -12,10 +12,10 @@
 import os
 import torch
 from random import randint
-from utils.loss_utils import l1_loss, ssim
+from utils.loss_utils import l1_loss, l2_loss, ssim
 from gaussian_renderer import render
 import sys
-from scene import Scene, GaussianModel, ParametrizedGaussianModel
+from scene import Scene, ParametrizedGaussianModel
 from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
@@ -24,40 +24,41 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 from render_video import write_video, render_rotate
 
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+def training(args, dataset, opt, pipe):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    #gaussians = GaussianModel(dataset.sh_degree)
-    gaussians = ParametrizedGaussianModel(1000, 3, 256, 5, 5).to("cuda")
+    gaussians = ParametrizedGaussianModel(32, 512, 4, 5).to("cuda").train()
     scene = Scene(dataset, gaussians)
     cameras = scene.getTrainCameras()
 
     # test sparse training from scratch
     print("training from scratch using parametrized gaussian")
-    #scene.gaussians.random_init(1_000_000, scene.cameras_extent)
-    #scene.train_cameras[1.0] = cameras[:10]
-    #scene.test_cameras[1.0] = cameras[10:]
+    scene.train_cameras[1.0] = cameras[:10]
+    scene.test_cameras[1.0] = cameras[10:]
 
     gaussians.training_setup(opt)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+    if args.reload:
+        (model_params, first_iter) = torch.load(args.reload)
         gaussians.restore(model_params, opt)
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     with torch.no_grad():
+        gaussians.decode()
         write_video(f"{dataset.model_path}/render_init.mp4",
-                render_rotate(gaussians, pipe, background))
+                    render_rotate(gaussians, pipe, background))
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -77,9 +78,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             viewpoint_stack = scene.getTrainCameras().copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
-        # Render
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
         gaussians.decode()
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
@@ -87,15 +85,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
+        #Ll2 = l2_loss(image, gt_image)
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
-        gradOutput = torch.autograd.grad(loss, gaussians.backbone.output)[0]
-        #print(f"=> gradOutput norm [{gradOutput.norm(p=2, dim=1).mean()}]")
-        gaussians.backward(gradOutput)
-        #loss.backward()
+        #gradOutput = torch.autograd.grad(loss, gaussians.backbone.output)[0]
+        #gaussians.backward(gradOutput)
+        loss.backward()
 
         iter_end.record()
 
         with torch.no_grad():
+            if (iteration + 1) % 1000 == 0:
+                write_video(f"{dataset.model_path}/render_{iteration}.mp4",
+                    render_rotate(gaussians, pipe, background))
+
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             if iteration % 10 == 0:
@@ -105,10 +107,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
+            tb_writer.add_scalar("train_latent_grad_norm", gaussians.latent.grad.norm(p=2, dim=1).mean().item(), iteration)
+            tb_writer.add_scalar("train_latent_norm", gaussians.latent.norm(p=2, dim=1).mean().item(), iteration)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), args.testing_iterations, scene, render, (pipe, background))
 
             # Densification
             if False:#iteration < opt.densify_until_iter:
@@ -128,9 +129,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
 
-            if (iteration in checkpoint_iterations):
-                print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
 def prepare_output_and_logger(args):
     if not args.model_path:
@@ -153,6 +151,7 @@ def prepare_output_and_logger(args):
     else:
         print("Tensorboard not available: not logging progress")
     return tb_writer
+
 
 def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs):
     if tb_writer:
@@ -191,33 +190,33 @@ def training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed, testing_i
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
 
+
 if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     lp = ModelParams(parser)
     op = OptimizationParams(parser)
     pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1, 1_000, 2_000, 3_000, 7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--arch", type=str, default="MLP")
+    parser.add_argument("--reload", type=str, default="")
+    parser.add_argument("--n_layer", type=int, default=5)
+    parser.add_argument("--n_hidden", type=int, default=512)
+    parser.add_argument("--render_every", type=int, default=1000)
+    parser.add_argument("--testing_iterations", default=[7_000, 30_000])
     args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
-    
+
     print("Optimizing " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    torch.autograd.set_detect_anomaly(args.detect_anomaly)
+    torch.autograd.set_detect_anomaly(True)
     test_iterations = args.test_iterations
     test_iterations = [i * 1000 for i in range(31)]
-    training(lp.extract(args), op.extract(args), pp.extract(args), test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(args, lp.extract(args), op.extract(args), pp.extract(args))
 
     # All done
     print("\nTraining complete.")
