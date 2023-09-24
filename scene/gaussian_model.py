@@ -464,16 +464,16 @@ class SineLayer(nn.Module):
             else:
                 self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0, 
                                              np.sqrt(6 / self.in_features) / self.omega_0)
-        
+
     def forward(self, input):
         return torch.sin(self.omega_0 * self.linear(input))
-    
+
     def forward_with_intermediate(self, input): 
         # For visualization of activation distributions
         intermediate = self.omega_0 * self.linear(input)
         return torch.sin(intermediate), intermediate
-    
-    
+
+
 class Siren(nn.Module):
     def __init__(self, in_features, hidden_features, hidden_layers, out_features, outermost_linear=False, 
                  first_omega_0=30, hidden_omega_0=30.):
@@ -608,22 +608,25 @@ class NeRFEncoding(nn.Module):
         if self.include_input:
             encoded_inputs = torch.cat([encoded_inputs, in_tensor], dim=-1)
         return encoded_inputs
-    
+
 
 class MLP(nn.Module):
-    def __init__(self, in_dim, h_dim, n_layer, out_dim, num_freq=10):
+    def __init__(self, in_dim, h_dim, n_layer, out_dim, embed_freq=32, num_freq=10):
         super().__init__()
-        self.in_dim = in_dim
         self.h_dim = h_dim
         self.out_dim = out_dim
         self.n_layer = n_layer
         self.pos_enc = NeRFEncoding(
-            in_dim=in_dim, num_frequencies=num_freq, min_freq_exp=0.0, max_freq_exp=8.0, include_input=True)
+            in_dim=3, num_frequencies=num_freq,
+            min_freq_exp=0.0, max_freq_exp=embed_freq,
+            include_input=True)
+        self.in_dim = in_dim + self.pos_enc.get_out_dim()
         layers = [self.in_dim] + [self.h_dim] * n_layer + [self.out_dim]
         self.layers = nn.ModuleList([nn.Linear(in_dim, out_dim)
                 for in_dim, out_dim in zip(layers[:-1], layers[1:])])
 
-    def forward(self, x):
+    def forward(self, coord, feat):
+        x = torch.cat([self.pos_enc(coord), feat], 1)
         for idx, layer in enumerate(self.layers):
             x = layer(x)
             if idx < len(self.layers) - 1:
@@ -631,15 +634,33 @@ class MLP(nn.Module):
         return x
 
 
-class ScaleLayer(nn.BatchNorm1d):
-    def __init__(self, shape, init_bias=None, init_scale=None):
-        super().__init__(shape)
-        if init_bias is not None:
-            self.load_state_dict({
-                "weight": init_scale,
-                "bias": init_bias
-            }, strict=False)
+class BNMLP(nn.Module):
+    def __init__(self, in_dim, h_dim, n_layer, out_dim, embed_freq=32, num_freq=10):
+        super().__init__()
+        assert n_layer % 2 == 0, "The number of layers must be even"
+        self.h_dim = h_dim
+        self.out_dim = out_dim
+        self.n_layer = n_layer
+        self.pos_enc = NeRFEncoding(
+            in_dim=3, num_frequencies=num_freq,
+            min_freq_exp=0.0, max_freq_exp=embed_freq,
+            include_input=True)
+        self.in_dim = in_dim + self.pos_enc.get_out_dim()
+        dims = [self.in_dim] + [self.h_dim] * n_layer + [self.out_dim]
+        layers = []
+        for idx, (in_dim, out_dim) in enumerate(zip(dims[:-1], dims[1:])):
+            layers.append(nn.Linear(in_dim, out_dim))
+            if idx % 2 == 0:
+                layers.append(torch.nn.BatchNorm1d(out_dim))
+            layers.append(torch.nn.GELU())
+        self.layers = nn.ModuleList(layers[:-2])
 
+    def forward(self, coord, feat):
+        x = torch.cat([self.pos_enc(coord), feat], 1)
+        for idx, layer in enumerate(self.layers):
+            x = layer(x)
+        return x
+    
 
 class ParametrizedGaussianModel(GaussianModel):
     """
@@ -647,29 +668,32 @@ class ParametrizedGaussianModel(GaussianModel):
         n_init: The number of initialized points.
     """
 
-    def __init__(self, in_dim, h_dim, n_layer, sh_degree):
+    def __init__(self, arch, latent_dim, hidden_size, n_layer, embed_freq=32, sh_degree=5):
         super(ParametrizedGaussianModel, self).__init__(sh_degree)
+        self.arch = arch
+        self.latent_dim = latent_dim
+        self.hidden_size = hidden_size
+        # just to create a template for the shapes
         self.random_init(10, self.spatial_lr_scale)
         self.param_names = ["_xyz", "_scaling", "_rotation", "_opacity", "_features_dc", "_features_rest"]
         self.param_dim = {
             pname: getattr(self, pname).view(10, -1).shape[1]
             for pname in self.param_names}
-        self._affine_init()
-
-        self.in_dim, self.h_dim = in_dim, h_dim
+        arch_func = {
+            "siren": Siren,
+            "mlp": BNMLP
+        }[arch]
         self.component_backbone = torch.nn.ModuleDict({
-            #pname: Siren(in_dim, h_dim, n_layer, self.param_dim[pname])
-            pname: MLP(in_dim, h_dim, n_layer, self.param_dim[pname])
+            pname: arch_func(latent_dim, hidden_size, n_layer, self.param_dim[pname], embed_freq)
             for pname in self.param_names})
         self.component_scale = torch.nn.ModuleDict({
-            pname: ScaleLayer(
-                shape=(self.param_dim[pname],),
-                **self.param_affine_init[pname])
+            pname: torch.nn.BatchNorm1d(self.param_dim[pname])
             for pname in self.param_names})
-        #self.in_coords = get_mgrid(30, 3)
-        n_init = 20000
-        self.latent = torch.randn(n_init, in_dim, device="cuda").requires_grad_(True)
+        self.in_coords = get_mgrid(30, 3).cuda().requires_grad_(True)
+        n_init = self.in_coords.shape[0]
+        self.latent = torch.randn(n_init, latent_dim, device="cuda").requires_grad_(True)
         self.max_radii2D = torch.zeros((n_init,), device="cuda")
+        self._affine_init()
 
     def _affine_init(self):
         """Create the affine initialization to get the initialization of points right."""
@@ -681,13 +705,11 @@ class ParametrizedGaussianModel(GaussianModel):
             "_features_dc": {"init_scale": 1, "init_bias": 0},
             "_features_rest": {"init_scale": 0.01, "init_bias": 0}
         }
-        self.param_affine_init = {}
         for pname in self.param_names:
-            dic = {}
-            dim = self.param_dim[pname]
-            for key in ["init_scale", "init_bias"]:
-                dic[key] = torch.ones((dim,)) * self.affine_init[pname][key]
-            self.param_affine_init[pname] = dic
+            layer = self.component_scale[pname]
+            layer.weight.data.fill_(self.affine_init[pname]["init_scale"])
+            layer.bias.data.fill_(self.affine_init[pname]["init_bias"])
+
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
@@ -719,8 +741,8 @@ class ParametrizedGaussianModel(GaussianModel):
                 'lr': training_args.rotation_lr,
                 "name": "rotation"
             }, {
-                'params': [self.latent],
-                'lr': training_args.position_lr_init,
+                'params': [self.latent, self.in_coords],
+                'lr': 1e-3,
                 "name": "latent"
             }, {
                 'params': self.component_scale.parameters(),
@@ -749,15 +771,16 @@ class ParametrizedGaussianModel(GaussianModel):
         self.component_backbone.to(device)
         self.component_scale.to(device)
         self.latent = self.latent.to(device)
+        self.in_coords = self.in_coords.to(device)
         return self
 
     def decode(self):
         """Decode to explicit p arameters"""
         for key, func in self.component_backbone.items():
             scaler = self.component_scale[key]
-            setattr(self, key, scaler(func(self.latent)))
+            x = func(self.in_coords, self.latent)
+            x = scaler(x)
+            setattr(self, key, x)
         N = self._features_dc.shape[0]
         self._features_dc = self._features_dc.view(N, 1, 3)
         self._features_rest = self._features_rest.view(N, -1, 3)
-        for key in self.param_names:
-            v = getattr(self, key)

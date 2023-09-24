@@ -21,10 +21,20 @@ def register(func):
 
 
 @register
-def recon():
+def recon(): # deprecated
     cmd = "python train_simple.py -s ../cdmPanoHead/colmap_data/seed{idx} --model_path PanoHead_185_random/seed{idx} --white_background"
     for idx in range(1, 100):
         yield cmd.format(idx=idx)
+
+
+@register
+def param_recon():
+    cmd = "python train_simple.py -s ../cdmPanoHead/colmap_data/seed{idx} --model_path ../../expr/GS_param/seed{idx} --white_background --arch {arch} --latent_dim {latent_dim} --n_layer {n_layer}"
+    idx = 1
+    for arch in ["mlp"]:
+        for n_layer in [2, 4, 8]:
+            for latent_dim in [16, 32]:
+                yield cmd.format(idx=idx, arch=arch, latent_dim=latent_dim, n_layer=n_layer)
 
 
 @register

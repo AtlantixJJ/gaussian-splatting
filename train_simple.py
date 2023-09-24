@@ -35,14 +35,18 @@ except ImportError:
 def training(args, dataset, opt, pipe):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
-    gaussians = ParametrizedGaussianModel(32, 512, 4, 5).to("cuda").train()
+    gaussians = ParametrizedGaussianModel(
+        arch=args.arch,
+        latent_dim=args.latent_dim,
+        hidden_size=args.hidden_size,
+        n_layer=args.n_layer).to("cuda").train()
     scene = Scene(dataset, gaussians)
     cameras = scene.getTrainCameras()
 
     # test sparse training from scratch
     print("training from scratch using parametrized gaussian")
-    scene.train_cameras[1.0] = cameras[:10]
-    scene.test_cameras[1.0] = cameras[10:]
+    scene.train_cameras[1.0] = cameras[:args.train_views]
+    scene.test_cameras[1.0] = cameras[args.train_views:]
 
     gaussians.training_setup(opt)
     if args.reload:
@@ -109,7 +113,7 @@ def training(args, dataset, opt, pipe):
             # Log and save
             tb_writer.add_scalar("train_latent_grad_norm", gaussians.latent.grad.norm(p=2, dim=1).mean().item(), iteration)
             tb_writer.add_scalar("train_latent_norm", gaussians.latent.norm(p=2, dim=1).mean().item(), iteration)
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), args.testing_iterations, scene, render, (pipe, background))
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), args.test_iterations, scene, render, (pipe, background))
 
             # Densification
             if False:#iteration < opt.densify_until_iter:
@@ -200,22 +204,24 @@ if __name__ == "__main__":
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--arch", type=str, default="MLP")
+    parser.add_argument("--arch", type=str, default="mlp")
     parser.add_argument("--reload", type=str, default="")
     parser.add_argument("--n_layer", type=int, default=5)
-    parser.add_argument("--n_hidden", type=int, default=512)
+    parser.add_argument("--latent_dim", type=int, default=32)
+    parser.add_argument("--enc_freq", type=int, default=32)
+    parser.add_argument("--hidden_size", type=int, default=512)
     parser.add_argument("--render_every", type=int, default=1000)
-    parser.add_argument("--testing_iterations", default=[7_000, 30_000])
+    parser.add_argument("--test_iterations", default=[7_000, 30_000])
+    parser.add_argument("--train_views", type=int, default=10)
     args = parser.parse_args(sys.argv[1:])
 
-    print("Optimizing " + args.model_path)
-
     # Initialize system state (RNG)
-    safe_state(args.quiet)
-
+    safe_state(False)
+    mlp_args = f"{args.arch}-{args.latent_dim}-{args.n_layer}-{args.hidden_size}"
+    args.model_path = f"{args.model_path}_{mlp_args}_view{args.train_views}"
+    print("Optimizing " + args.model_path)
+    
     torch.autograd.set_detect_anomaly(True)
-    test_iterations = args.test_iterations
-    test_iterations = [i * 1000 for i in range(31)]
     training(args, lp.extract(args), op.extract(args), pp.extract(args))
 
     # All done
